@@ -33,9 +33,12 @@
 #define RECOVERY_WAIT_SECS   60
 #define NORMAL_WAIT_SECS     90
 
-/* Apple USB IDs */
-#define APPLE_VID_PATH_B     0x05AC
-#define RECOVERY_PID_PATH_B  0x1281
+/* Apple USB IDs: recovery mode can enumerate as any PID 0x1280..0x1283. */
+#define APPLE_VID_PATH_B          0x05AC
+#define RECOVERY_PID_FIRST_PATH_B 0x1280
+#define RECOVERY_PID_LAST_PATH_B  0x1283
+#define DFU_PID_PATH_B            0x1227
+#define PORT_DFU_PID_PATH_B       0xF014
 
 /* Forward declarations for module callbacks. */
 static int path_b_probe(device_info_t *dev);
@@ -93,6 +96,8 @@ static int step_reboot_to_recovery(device_info_t *dev)
     ssize_t          i;
     int              elapsed = 0;
     int              found   = 0;
+    int              abort_rc;
+    int              last_apple_pid = -1;
 
     log_info("[path_b] Step 1/10: Rebooting device from DFU to recovery mode...");
 
@@ -102,15 +107,23 @@ static int step_reboot_to_recovery(device_info_t *dev)
     }
 
     /* DFU_ABORT: bmRequestType=0x21 (class, interface, host-to-device),
-     * bRequest=DFU_ABORT(6), wValue=0, wIndex=0, wLength=0 */
-    libusb_control_transfer(dev->usb, 0x21, 6, 0, 0, NULL, 0, 1000);
+     * bRequest=DFU_ABORT(6), wValue=0, wIndex=0, wLength=0.
+     * A successful USB request does NOT guarantee a mode transition. */
+    abort_rc = libusb_control_transfer(dev->usb, 0x21, 6, 0, 0, NULL, 0, 1000);
+    if (abort_rc < 0) {
+        /* A disconnect during a reset can report NO_DEVICE: still poll USB. */
+        log_warn("[path_b] DFU_ABORT transfer returned %s (code %d); "
+                 "checking device mode anyway", libusb_error_name(abort_rc), abort_rc);
+    } else if (abort_rc != 0) {
+        log_warn("[path_b] DFU_ABORT returned unexpected length %d", abort_rc);
+    }
 
-    /* Release DFU handle -- device is resetting */
+    /* Release the handle for USB re-enumeration. Do not assume recovery yet. */
     usb_dfu_close(dev->usb);
     dev->usb         = NULL;
     dev->is_dfu_mode = 0;
 
-    log_info("[path_b] DFU abort sent, waiting for recovery mode...");
+    log_info("[path_b] DFU_ABORT attempted; checking USB enumeration for recovery mode...");
 
     if (libusb_init(&ctx) != LIBUSB_SUCCESS) {
         log_error("[path_b] libusb_init failed for recovery poll");
@@ -123,16 +136,22 @@ static int step_reboot_to_recovery(device_info_t *dev)
 
         count = libusb_get_device_list(ctx, &devs);
         if (count < 0) {
-            libusb_free_device_list(devs, 1);
+            log_debug("[path_b] USB enumeration failed: %s",
+                      libusb_error_name((int)count));
             continue;
         }
 
+        last_apple_pid = -1;
         for (i = 0; i < count && !found; i++) {
             struct libusb_device_descriptor desc;
             if (libusb_get_device_descriptor(devs[i], &desc) != LIBUSB_SUCCESS)
                 continue;
-            if (desc.idVendor == APPLE_VID_PATH_B &&
-                desc.idProduct == RECOVERY_PID_PATH_B)
+            if (desc.idVendor != APPLE_VID_PATH_B)
+                continue;
+
+            last_apple_pid = desc.idProduct;
+            if (desc.idProduct >= RECOVERY_PID_FIRST_PATH_B &&
+                desc.idProduct <= RECOVERY_PID_LAST_PATH_B)
                 found = 1;
         }
 
@@ -149,6 +168,17 @@ static int step_reboot_to_recovery(device_info_t *dev)
     }
 
     libusb_exit(ctx);
+    if (last_apple_pid == DFU_PID_PATH_B ||
+        last_apple_pid == PORT_DFU_PID_PATH_B) {
+        log_error("[path_b] Apple device is still in DFU mode (PID 0x%04X); "
+                  "DFU_ABORT did not cause a recovery transition", last_apple_pid);
+    } else if (last_apple_pid < 0) {
+        log_error("[path_b] No Apple USB device visible at timeout; "
+                  "on WSL2 inspect 'usbipd list' for lost USB attachment");
+    } else {
+        log_error("[path_b] Apple USB PID 0x%04X observed, not recovery mode",
+                  last_apple_pid);
+    }
     log_error("[path_b] Timed out waiting for recovery mode (%ds)", RECOVERY_WAIT_SECS);
     return -1;
 }
